@@ -93,7 +93,7 @@ def extract_toc(pdf_path: str) -> List[Dict]:
         logger.error("从 %s 提取目录时出错: %s", pdf_path, e)
         return []
 
-def segment_text_to_blocks(text: str, min_block_length: int = 50) -> List[str]:
+def segment_text_to_blocks(text: str, min_block_length: int = 150) -> List[str]:
     """将文本分割为语义完整的块，优先使用空行，合并短块。"""
     try:
         blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
@@ -120,64 +120,65 @@ def segment_text_to_blocks(text: str, min_block_length: int = 50) -> List[str]:
 def extract_content(pdf_path: str, toc: List[Dict], batch_file: str) -> None:
     """按标题层级提取内容并追加到批处理文件，确保跨页语义完整。"""
     try:
-        def process_node(node: Dict, title_path: List[str], parent_path: List[str]):
-            current_path = title_path + [node["title"]]
-            start_page = node["start_page"] - 1
-            end_page = node["end_page"] - 1
-            
-            # Skip if node has subsections (process only leaf nodes)
-            if node["subsections"]:
-                for subsection in node["subsections"]:
-                    process_node(subsection, current_path, parent_path + [node["title"]])
-                return
-            
-            # Extract text for leaf node
-            node_text = ""
-            with fitz.open(pdf_path) as doc:
+        with fitz.open(pdf_path) as doc:
+            def process_node(node: Dict, title_path: List[str], parent_path: List[str]):
+                current_path = title_path + [node["title"]]
+                start_page = node["start_page"] - 1
+                end_page = node["end_page"] - 1
+                
+                page_count = end_page - start_page + 1
+                if page_count > 50:
+                    logger.warning("节点 %s 页面范围过大 (%d 页)，可能导致内存压力", node["title"], page_count)
+                
+                # Skip if node has subsections (process only leaf nodes)
+                if node["subsections"]:
+                    for subsection in node["subsections"]:
+                        process_node(subsection, current_path, parent_path + [node["title"]])
+                    return
+                
+                # Extract text for leaf node
+                node_text = ""
                 for page_num in tqdm(range(start_page, end_page + 1), desc=f"提取 {node['title']} 页面", leave=False):
                     try:
                         page = doc[page_num]
-                        blocks = page.get_text("blocks")
-                        for block in blocks:
-                            if block[4].strip():
-                                node_text += block[4].strip() + "\n\n"
+                        node_text += page.get_text("text") + "\n\n"
                         del page
                         gc.collect()
                     except Exception as e:
                         logger.warning("提取 %s 页面 %d 时出错: %s", pdf_path, page_num + 1, e)
                         continue
-            
-            blocks = segment_text_to_blocks(node_text, min_block_length=100)  # Increased for semantic completeness
-            logger.info("从 %s 的 %s 生成 %d 个语义块", pdf_path, node["title"], len(blocks))
-            
-            knowledge_fragments = []
-            for block_idx, block_text in enumerate(blocks, 1):
-                fragment_id = str(uuid.uuid4())
-                fragment = {
-                    "id": fragment_id,
-                    "textbook": os.path.basename(pdf_path),
-                    "title_path": current_path,
-                    "block_id": block_idx,
-                    "text": block_text,
-                    "page_range": [start_page + 1, end_page + 1],
-                    "relations": {
-                        "parent_path": parent_path,
-                        "sibling_blocks": [str(i) for i in range(1, len(blocks) + 1) if i != block_idx]
+                
+                blocks = segment_text_to_blocks(node_text)
+                logger.info("从 %s 的 %s 生成 %d 个语义块", pdf_path, node["title"], len(blocks))
+                
+                knowledge_fragments = []
+                for block_idx, block_text in enumerate(blocks, 1):
+                    fragment_id = str(uuid.uuid4())
+                    fragment = {
+                        "id": fragment_id,
+                        "textbook": os.path.basename(pdf_path),
+                        "title_path": current_path,
+                        "block_id": block_idx,
+                        "text": block_text,
+                        "page_range": [start_page + 1, end_page + 1],
+                        "relations": {
+                            "parent_path": parent_path,
+                            "sibling_blocks": [str(i) for i in range(1, len(blocks) + 1) if i != block_idx]
+                        }
                     }
-                }
-                knowledge_fragments.append(fragment)
+                    knowledge_fragments.append(fragment)
+                
+                # Append to batch file
+                with open(batch_file, "a", encoding="utf-8") as f:
+                    for fragment in knowledge_fragments:
+                        json.dump(fragment, f, ensure_ascii=False)
+                        f.write("\n")
+                
+                del knowledge_fragments, node_text
+                gc.collect()
             
-            # Append to batch file
-            with open(batch_file, "a", encoding="utf-8") as f:
-                for fragment in knowledge_fragments:
-                    json.dump(fragment, f, ensure_ascii=False)
-                    f.write("\n")
-            
-            del knowledge_fragments, node_text
-            gc.collect()
-        
-        for node in toc:
-            process_node(node, [], [])
+            for node in toc:
+                process_node(node, [], [])
         
         log_memory_usage()
     except Exception as e:
@@ -226,7 +227,7 @@ def process_pdf_folder(folder_path: str, output_json: str) -> None:
                     output_json, len(textbooks), len(all_fragments))
     except Exception as e:
         logger.error("处理文件夹 %s 时出错: %s", folder_path, e)
-
+        
 if __name__ == "__main__":
     # Disable multiprocessing to avoid semaphore leaks
     import os
