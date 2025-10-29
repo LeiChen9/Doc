@@ -82,6 +82,7 @@ def iter_epub_blocks(epub_path: str, min_para_len: int = 50) -> Iterable[Dict]:
         metadata, manifest, spine = _parse_opf(zf, opf_path)
 
         chapter_stack: List[str] = []
+        import pdb; pdb.set_trace()
         for idx, href in enumerate(spine, start=1):
             html = _read_zip_text(zf, href)
             content, headings = _extract_text_from_xhtml(html)
