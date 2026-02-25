@@ -1,295 +1,170 @@
 import json
-import logging
-import gc
-import psutil
 import os
-import re
-from whoosh.index import create_in
-from whoosh.fields import Schema, TEXT, ID
-from whoosh.qparser import QueryParser
-from whoosh import scoring
-import uuid
-from difflib import SequenceMatcher  # For edit distance (similarity ratio)
-from collections import defaultdict
-import time
+from typing import List, Dict, Tuple, Optional
+import pdb
+from sentence_transformers import SentenceTransformer, util  # 用于语义相似度匹配
+from openai import OpenAI
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
 
-# Log memory usage
-def log_memory_usage():
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    logger.info("当前内存使用: %.2f MB", mem_info.rss / 1024 / 1024)
+# 配置OpenAI API（替换为你的API密钥；如果使用xAI，调整客户端）
+BASE_URL = os.getenv("OPENAI_BASE_URL", "http://chatapi.littlewheat.com/v1")
+API_KEY = os.getenv("OPENAI_API_KEY", "sk-3o7OxkzUFZeQDbUFLIEgiXYXpulbKnKOJ7OAoiMyepxhbnYK")
 
-class KnowledgeSearchEngine:
-    def __init__(self, json_path: str):
-        self.json_path = json_path
-        self.documents = []  # Flat list: {'id': str, 'textbook': str, 'title_path': list, 'page_range': list, 'text': str}
-        self.document_map = {}  # id -> document mapping for fast lookup
-        self.text_lower_map = {}  # id -> lowercased text for fast search
-        self.keyword_index = defaultdict(set)  # keyword -> set of document ids
-        self.load_and_flatten()
-        self.build_indexes()
-    
-    def load_and_flatten(self):
-        """Flatten JSON to documents with metadata."""
-        with open(self.json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        def flatten_toc(node: dict, current_path: list, textbook: str):
-            title_path = current_path + [node["title"]]
-            for para_idx, para in enumerate(node["content"], 1):
-                doc_id = str(uuid.uuid4())
-                doc = {
-                    "id": doc_id,
-                    "textbook": textbook,
-                    "title_path": title_path,
-                    "page_range": [node["start_page"], node["end_page"]],
-                    "text": para
-                }
-                self.documents.append(doc)
-                self.document_map[doc_id] = doc
-                self.text_lower_map[doc_id] = para.lower()
-                
-                # Build keyword index for fast lookup
-                words = re.findall(r'\w+', para.lower())
-                for word in words:
-                    if len(word) > 2:  # Only index words longer than 2 characters
-                        self.keyword_index[word].add(doc_id)
-            
-            for sub_title, sub_node in node["subsections"].items():
-                flatten_toc(sub_node, title_path, textbook)
-        
-        for textbook in data["textbooks"]:
-            for title, node in textbook.get("toc", {}).items():
-                flatten_toc(node, [], textbook["textbook_name"])
-        
-        logger.info(f"Flattened {len(self.documents)} documents")
-        log_memory_usage()
-    
-    def build_indexes(self):
-        """Build only Whoosh (BM25) index - no embedding models."""
-        # Whoosh for BM25
-        schema = Schema(id=ID(stored=True), text=TEXT(stored=True))
-        if not os.path.exists("src/whoosh_index"):
-            os.makedirs("src/whoosh_index", exist_ok=True)
-        
-        # Use existing index if available
-        try:
-            from whoosh.index import open_dir
-            self.ix = open_dir("src/whoosh_index")
-            logger.info("Using existing Whoosh BM25 index")
-        except:
-            self.ix = create_in("src/whoosh_index", schema)
-            writer = self.ix.writer()
-            for doc in self.documents:
-                writer.add_document(id=doc["id"], text=doc["text"])
-            writer.commit()
-            logger.info("Built new Whoosh BM25 index")
-        
-        log_memory_usage()
-    
-    def expand_query(self, user_query: str) -> list:
-        """Simple query expansion without LLM - extract key terms."""
-        # Extract Chinese and English words
-        chinese_words = re.findall(r'[\u4e00-\u9fff]+', user_query)
-        english_words = re.findall(r'[a-zA-Z]+', user_query.lower())
-        
-        # Combine all terms
-        all_terms = chinese_words + english_words
-        
-        # Add original query as whole
-        expanded_terms = [user_query.lower()] + all_terms
-        
-        # Remove duplicates and empty strings
-        return list(set([term for term in expanded_terms if term.strip()]))
-    
-    def calculate_text_relevance_score(self, text: str, query_terms: list) -> float:
-        """Calculate relevance score using keyword matching and edit distance."""
-        text_lower = text.lower()
-        score = 0.0
-        
-        # 1. Exact keyword matches (highest weight)
-        for term in query_terms:
-            if term.lower() in text_lower:
-                score += 2.0
-        
-        # 2. Edit distance similarity for query string
-        edit_sim = self.edit_distance_similarity(query_terms[0], text) if query_terms else 0.0
-        score += edit_sim
-        
-        # 3. Word overlap bonus
-        query_words = set(re.findall(r'\w+', ' '.join(query_terms).lower()))
-        text_words = set(re.findall(r'\w+', text_lower))
-        overlap = len(query_words.intersection(text_words))
-        score += overlap * 0.5
-        
-        return min(score, 10.0)  # Cap at 10.0
-    
-    def keyword_search(self, query_terms: list, top_k: int = 50) -> dict:
-        """Fast keyword search using pre-built keyword index."""
-        doc_scores = defaultdict(float)
-        
-        for term in query_terms:
-            term_lower = term.lower()
-            
-            # Direct keyword match
-            if term_lower in self.keyword_index:
-                for doc_id in self.keyword_index[term_lower]:
-                    doc_scores[doc_id] += 3.0  # High score for exact keyword match
-            
-            # Partial match in keyword index
-            for keyword in self.keyword_index:
-                if term_lower in keyword or keyword in term_lower:
-                    for doc_id in self.keyword_index[keyword]:
-                        doc_scores[doc_id] += 1.0  # Lower score for partial match
-        
-        # Sort by score and return top results
-        sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
-        return dict(sorted_docs[:top_k])
-    
-    def simple_grep_search(self, query: str, top_k: int = 50) -> list:
-        """Simple grep-like search: check if query in text (case-insensitive)."""
-        matches = []
-        lower_query = query.lower()
-        for doc_id, text_lower in self.text_lower_map.items():
-            if lower_query in text_lower:
-                matches.append(doc_id)
-            if len(matches) >= top_k:
-                break
-        return matches
-    
-    def edit_distance_similarity(self, str1: str, str2: str) -> float:
-        """Compute similarity ratio using SequenceMatcher (edit distance based)."""
-        return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
-    
-    def bm25_search(self, query: str, top_k: int = 50) -> list:
-        """BM25 search with Whoosh."""
-        with self.ix.searcher(weighting=scoring.BM25F) as searcher:
-            parser = QueryParser("text", self.ix.schema)
-            q = parser.parse(query)
-            results = searcher.search(q, limit=top_k)
-            return [hit["id"] for hit in results]
-    
-    def edit_distance_search(self, query: str, top_k: int = 50, threshold: float = 0.3) -> dict:
-        """Search using edit distance similarity."""
-        doc_scores = {}
-        query_lower = query.lower()
-        
-        # Only search through a subset for performance
-        search_limit = min(1000, len(self.documents))  # Limit search for speed
-        
-        for i, (doc_id, text_lower) in enumerate(list(self.text_lower_map.items())[:search_limit]):
-            # Use shorter text for faster comparison
-            short_text = text_lower[:500]  # Limit text length for speed
-            similarity = self.edit_distance_similarity(query_lower, short_text)
-            
-            if similarity >= threshold:
-                doc_scores[doc_id] = similarity
-        
-        # Sort by score and return top results
-        sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
-        return dict(sorted_docs[:top_k])
-    
-    def merge_search_results(self, *result_dicts) -> dict:
-        """Merge multiple search result dictionaries by combining scores."""
-        merged_scores = defaultdict(float)
-        
-        for result_dict in result_dicts:
-            for doc_id, score in result_dict.items():
-                merged_scores[doc_id] += score
-        
-        # Sort by combined score
-        sorted_results = sorted(merged_scores.items(), key=lambda x: x[1], reverse=True)
-        return dict(sorted_results)
-    
-    def evaluate_results(self, result_dict: dict, query_terms: list, min_score_threshold: float = 2.0) -> bool:
-        """Evaluate if results are good enough using keyword matching and edit distance."""
-        if not result_dict:
-            return False
-        
-        # Check if top results have good scores
-        top_scores = list(result_dict.values())[:5]
-        if not top_scores:
-            return False
-        
-        avg_score = sum(top_scores) / len(top_scores)
-        max_score = max(top_scores)
-        
-        logger.info(f"Avg score: {avg_score:.2f}, Max score: {max_score:.2f}")
-        return max_score >= min_score_threshold
-    
-    def search(self, user_query: str, top_n: int = 5) -> list:
-        """Fast search using keyword matching and edit distance - no LLM or embeddings."""
-        start_time = time.time()
-        
-        # Expand query to get search terms
-        query_terms = self.expand_query(user_query)
-        logger.info(f"Search terms: {query_terms}")
-        
-        # Stage 1: Fast keyword search
-        keyword_results = self.keyword_search(query_terms, top_k=100)
-        
-        # Stage 2: Simple grep search for exact matches
-        grep_ids = self.simple_grep_search(user_query, top_k=50)
-        grep_results = {doc_id: 5.0 for doc_id in grep_ids}  # High score for exact matches
-        
-        # Stage 3: BM25 search as backup
-        bm25_ids = self.bm25_search(user_query, top_k=50)
-        bm25_results = {}
-        for i, doc_id in enumerate(bm25_ids):
-            bm25_results[doc_id] = 3.0 - (i * 0.1)  # Decreasing score by rank
-        
-        # Merge all results
-        final_results = self.merge_search_results(keyword_results, grep_results, bm25_results)
-        
-        # If results are not good enough, try edit distance search on top results
-        if not self.evaluate_results(final_results, query_terms, min_score_threshold=1.0):
-            logger.info("Enhancing with edit distance search")
-            edit_results = self.edit_distance_search(user_query, top_k=30, threshold=0.2)
-            final_results = self.merge_search_results(final_results, edit_results)
-        
-        # Convert to final format
-        results = []
-        for doc_id, score in list(final_results.items())[:top_n * 2]:  # Get more candidates
-            doc = self.document_map[doc_id]
-            
-            # Add relevance score for final ranking
-            relevance_score = self.calculate_text_relevance_score(doc["text"], query_terms)
-            final_score = score + relevance_score
-            
-            path_str = " > ".join(doc["title_path"])
-            results.append({
-                "textbook": doc["textbook"],
-                "path": path_str,
-                "page_range": f"第 {doc['page_range'][0]}-{doc['page_range'][1]} 页",
-                "text": doc["text"][:200] + "..." if len(doc["text"]) > 200 else doc["text"],
-                "score": final_score
-            })
-        
-        # Sort by final score and return top results
-        results.sort(key=lambda x: x["score"], reverse=True)
-        final_results_list = results[:top_n]
-        
-        # Remove score from final output (internal use only)
-        for result in final_results_list:
-            result.pop("score", None)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Found {len(final_results_list)} results for query: {user_query} in {elapsed_time:.2f}s")
-        log_memory_usage()
-        
-        return final_results_list
+# 加载嵌入模型（用于语义相似度）
+embedder = SentenceTransformer('all-MiniLM-L6-v2')  # 轻量级嵌入模型
 
-# Example usage
+# 加载知识库JSON（假设路径为固定；可参数化）
+KNOWLEDGE_JSON_PATH = "../data/know/merck_guide_aug.json"
+
+def load_knowledge_base() -> Dict:
+    """加载JSON知识库，返回book_tree和toc_tree"""
+    with open(KNOWLEDGE_JSON_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data["book_tree"], data["search_guide"]["toc_tree"]
+
+# 扁平化book_tree为段落列表，每个项为(路径字符串, 段落文本)
+def flatten_book_tree(book_tree: Dict, current_path: str = "") -> List[Tuple[str, str]]:
+    flat_list = []
+    for title, node in book_tree.items():
+        new_path = f"{current_path} > {title}" if current_path else title
+        for para in node.get("paragraphs", []):
+            flat_list.append((new_path, para))
+        flat_list.extend(flatten_book_tree(node.get("children", {}), new_path))
+    return flat_list
+
+# LLM调用函数
+def llm_call(prompt: str, model: str = "gpt-4-turbo") -> str:
+    client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    """调用LLM生成响应"""
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+# 步骤1: LLM refine用户查询，翻译成专业医学问题并提取关键词
+def refine_query(user_input: str, toc_tree: Dict) -> Tuple[str, List[str]]:
+    """使用LLM refine查询并提取关键词"""
+    toc_str = json.dumps(toc_tree, ensure_ascii=False, indent=2)
+    prompt = f"""
+    用户查询: {user_input}
+    书籍目录结构 (toc_tree): {toc_str}
+    
+    结合你的医学知识和书籍目录结构，将用户查询翻译成专业医学问题。
+    然后，从专业问题中提取3-5个关键词（医学术语）。
+    
+    输出格式:
+    专业问题: [refined query]
+    关键词: [keyword1, keyword2, ...]
+    """
+    response = llm_call(prompt)
+    pdb.set_trace()
+    lines = response.split("\n")
+    refined_query = lines[0].split(": ", 1)[1] if len(lines) > 0 else ""
+    keywords = eval(lines[1].split(": ", 1)[1]) if len(lines) > 1 else []
+    return refined_query, keywords
+
+# 步骤2: 使用关键词匹配章节
+def match_chapters(keywords: List[str], toc_tree: Dict) -> List[str]:
+    """关键词匹配章节，返回匹配的章节路径列表"""
+    matched_paths = []
+    for chapter, sections in toc_tree.items():
+        if any(kw.lower() in chapter.lower() for kw in keywords):
+            matched_paths.append(chapter)
+        for section, subsections in sections.items():
+            if any(kw.lower() in section.lower() for kw in keywords):
+                matched_paths.append(f"{chapter} > {section}")
+            for sub in subsections:
+                if any(kw.lower() in sub.lower() for kw in keywords):
+                    matched_paths.append(f"{chapter} > {section} > {sub}")
+    return list(set(matched_paths))  # 去重
+
+# 步骤3: 语义相似度匹配段落
+def semantic_match(refined_query: str, flat_paragraphs: List[Tuple[str, str]], top_k: int = 10) -> List[Tuple[str, str]]:
+    """使用嵌入模型匹配相关段落"""
+    query_emb = embedder.encode(refined_query)
+    para_embs = embedder.encode([para for _, para in flat_paragraphs])
+    scores = util.pytorch_cos_sim(query_emb, para_embs)[0]
+    top_indices = scores.topk(top_k).indices.tolist()
+    matched = [(flat_paragraphs[i][0], flat_paragraphs[i][1]) for i in top_indices]
+    return matched
+
+# 步骤4: LLM审阅召回结果，选择最多3个片段
+def review_results(chapter_matches: List[str], semantic_matches: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """LLM审阅并选择最多3个最相关片段"""
+    recall_str = f"章节匹配: {chapter_matches}\n语义匹配: {[(path, para[:100] + '...') for path, para in semantic_matches]}"
+    prompt = f"""
+    召回结果: {recall_str}
+    
+    审阅以上召回结果，选择最多3个最有可能回答用户问题的片段（路径和完整段落）。
+    如果没有相关片段，返回空列表。
+    
+    输出格式: [(路径1, 段落1), (路径2, 段落2), ...] 或 []
+    """
+    response = llm_call(prompt)
+    try:
+        selected = eval(response)
+    except:
+        selected = []
+    return selected[:3]
+
+# 步骤5: 根据结果总结并引导提问
+def summarize_and_guide(selected_segments: List[Tuple[str, str]], search_history: str, is_empty: bool) -> str:
+    """总结搜索过程并引导用户"""
+    if is_empty:
+        prompt = f"""
+        搜索过程总结: {search_history}
+        没有找到相关片段。请引导用户提供更多细节，通过提问refine查询。
+        
+        输出: 总结 + 引导提问
+        """
+    else:
+        segments_str = "\n".join([f"路径: {path}\n片段: {para}" for path, para in selected_segments])
+        prompt = f"""
+        搜索过程总结: {search_history}
+        找到的相关片段: {segments_str}
+        
+        返回这些片段作为搜索结果，然后总结搜索过程，并引导用户进一步提问以refine。
+        
+        输出: 搜索结果 + 总结 + 引导提问
+        """
+    return llm_call(prompt)
+
+# 主循环
+def main():
+    book_tree, toc_tree = load_knowledge_base()
+    flat_paragraphs = flatten_book_tree(book_tree)
+    
+    search_history = ""  # 记录搜索过程
+    
+    while True:
+        user_input = input("请输入您的查询 (输入 'exit' 退出): ")
+        if user_input.lower() == 'exit':
+            break
+        
+        # 步骤1
+        refined_query, keywords = refine_query(user_input, toc_tree)
+        search_history += f"用户查询: {user_input}\nRefined: {refined_query}\n关键词: {keywords}\n"
+        
+        # 步骤2 & 3 (同步)
+        chapter_matches = match_chapters(keywords, toc_tree)
+        semantic_matches = semantic_match(refined_query, flat_paragraphs)
+        
+        search_history += f"章节匹配: {chapter_matches}\n语义匹配数: {len(semantic_matches)}\n"
+        
+        # 步骤4
+        selected_segments = review_results(chapter_matches, semantic_matches)
+        
+        # 步骤5
+        is_empty = len(selected_segments) == 0
+        response = summarize_and_guide(selected_segments, search_history, is_empty)
+        print(response)
+        
+        # 步骤6: 循环返回步骤1
+
 if __name__ == "__main__":
-    engine = KnowledgeSearchEngine("../data/sample_knowledge_fragments.json")
-    query = "骨骼系统的功能是什么？"
-    results = engine.search(query)
-    for res in results:
-        print(f"教材: {res['textbook']}, 路径: {res['path']}, 页码: {res['page_range']}")
-        if 'text' in res:
-            print(f"内容预览: {res['text']}")
-        print("-" * 50)
+    main()

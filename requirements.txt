@@ -5,4 +5,8 @@ tqdm>=4.66.1
 psutil>=5.9.8
 PyMuPDF>=1.24.1
 whoosh>=2.7.4
+akshare>=1.12.0
+pandas>=1.5.0
+numpy>=1.24.0
+matplotlib>=3.7.0
 
