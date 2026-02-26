@@ -41,6 +41,85 @@ def flatten_book_tree(book_tree: Dict, current_path: str = "") -> List[Tuple[str
         flat_list.extend(flatten_book_tree(node.get("children", {}), new_path))
     return flat_list
 
+
+def _build_toc_recall_units(toc_tree: Dict) -> List[Tuple[str, str]]:
+    """
+    为 toc 语义召回构建 (key, value) 单元：
+    - key: "章" 或 "章 > 节"
+    - value: 该 key 下所有「章-节-小节」名称的汇总文本，用于做语义相似度匹配
+
+    示例：
+    key = "消化系统 > 胃炎"
+    value = "消化系统 > 胃炎: 急性胃炎; 慢性胃炎; 萎缩性胃炎"
+    """
+    units: List[Tuple[str, str]] = []
+    for chapter, sections in toc_tree.items():
+        # 章节级：value 包含该章下所有节与子节名称
+        for sec, subsecs in sections.items():
+            units.append((f"{chapter} > {sec}", f"{chapter} > {sec}: " + "; ".join(str(s) for s in subsecs)))
+    return units
+
+
+def semantic_recall_toc(user_input: str, toc_tree: Dict, top_k: int = 20) -> List[str]:
+    """
+    对 toc_tree 做一次基于语义相似度的召回，返回按相关度排序的路径列表。
+    注意：这里只是为了给 LLM 提示一个更短的目录视图，真正的章节/段落检索仍然使用完整 toc_tree，
+    因此不会牺牲整体 recall。
+    """
+    units = _build_toc_recall_units(toc_tree)
+    if not units:
+        return []
+    keys = [k for k, _ in units]
+    texts = [v for _, v in units]
+    query_emb = embedder.encode(user_input)
+    toc_embs = embedder.encode(texts)
+    scores = util.pytorch_cos_sim(query_emb, toc_embs)[0]
+    k = min(top_k, len(keys))
+    top_indices = scores.topk(k).indices.tolist()
+    recalled = [keys[i] for i in top_indices]
+    logger.info("semantic_recall_toc 完成，目录单元数=%d，top_k=%d", len(keys), len(recalled))
+    pdb.set_trace()
+    return recalled
+
+
+def _build_recalled_outline(recalled_paths: List[str], toc_tree: Dict) -> str:
+    """
+    根据语义召回得到的路径，展开对应「章-节」的本地目录。
+    - 对于只有章节的路径：展示该章节下所有节与子节
+    - 对于“章 > 节”的路径：展示该节下的子节
+    """
+    blocks: List[str] = []
+    for path in recalled_paths:
+        if " > " in path:
+            chapter, section = path.split(" > ", 1)
+        else:
+            chapter, section = path, None
+
+        sections = toc_tree.get(chapter, {})
+        if not isinstance(sections, dict):
+            continue
+
+        lines: List[str] = []
+        if section is None:
+            # 展开整章的节与子节
+            lines.append(f"章节: {chapter}")
+            for sec, subsecs in sections.items():
+                lines.append(f"  - 节: {sec}")
+                for sub in subsecs:
+                    lines.append(f"    - 子节: {sub}")
+        else:
+            subsecs = sections.get(section)
+            if subsecs is None:
+                continue
+            lines.append(f"章节: {chapter} > 节: {section}")
+            for sub in subsecs:
+                lines.append(f"  - 子节: {sub}")
+
+        if lines:
+            blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
 # LLM调用函数
 def llm_call(prompt: str, model: str = "gpt-4-turbo") -> str:
     """调用LLM生成响应，简单包装一下 Chat Completions 接口"""
@@ -90,38 +169,48 @@ def _parse_llm_json(raw: str) -> dict:
 
 # 步骤1: LLM refine用户查询，翻译成专业医学问题并提取关键词
 def refine_query(user_input: str, toc_tree: Dict) -> Tuple[str, List[str]]:
-    """使用LLM refine查询并提取关键词"""
-    toc_str = json.dumps(toc_tree, ensure_ascii=False, indent=2)
+    """
+    使用 LLM 对用户查询进行医学翻译与关键词推理。
+    注意：这一步只依赖用户输入本身，不依赖 toc_tree，以避免目录结构对推理产生偏置。
+    """
     prompt = f"""
 你是一个专业医学助手，负责标准化用户问题并抽取医学关键词。
 
-现在给你：
-- 用户原始查询（自然语言）
-- 书籍目录结构 toc_tree（JSON）
+现在给你一条用户的自然语言问题（可能带有口语化、方言、比喻或不规范的描述），
+你的任务是将其翻译成规范的医学问题，并推理出与之高度相关的医学关键词，用于后续在教科书中进行检索。
 
 请你：
-1. 结合医学知识和 toc_tree，将用户查询翻译为一个简明、规范的「专业医学问题」。
-2. 从这个专业问题中提取 3-5 个医学关键词，关键词用中文或常用拉丁学名均可。
+1. 先根据你的医学知识，将用户的自然语言问题翻译为一个简明、规范的「专业医学问题」（可以适当补全隐含信息，但不要引入明显无关内容）。
+2. 在你内心中，对所有可能相关的医学概念、解剖结构、疾病名称、症状体征、检查方法和治疗手段进行一次“穷举思考”，找出所有**有较大可能**会被用来检索本问题相关内容的医学关键词或常用近义表达。
+3. 对于每一个候选关键词，在你内部为它估计一个「被用于检索相关医学内容的合理概率」p（0~1 之间）。**只有当 p ≥ 0.05 时才保留该关键词**；p 更低（“几乎不会用来检索”的）候选词一律丢弃，以避免关键词爆炸。
+4. 最终输出的关键词列表应：既尽量覆盖所有真正可能相关的医学表达（高召回），又避免引入太多牵强的远房关联（控制噪声），列表长度可以变化，但不要为了凑数而增加弱相关词。
+5. 用自然语言简要说明：你是如何从原始问题改写出 refined_query 的，以及你选择这些关键词的依据和筛选逻辑（包括你如何应用「p ≥ 0.05」这一阈值），但**不要在说明中展开你的完整推理过程，只给出简洁结论**。
 
 严格按照下面的 JSON 模板输出，必须是合法的 JSON 且只能包含这一段 JSON，不要输出任何额外文字、解释或注释：
 {{
   "refined_query": "用一句话表述的专业医学问题",
-  "keywords": ["关键词1", "关键词2", "关键词3"]
+  "keywords": ["关键词1", "关键词2", "关键词3"],
+  "rationale": "一句或几句自然语言，解释 refined_query 的改写逻辑以及关键词选取逻辑"
 }}
 
 输入：
 用户查询: {user_input}
-书籍目录结构 (toc_tree): {toc_str}
 """
     response = llm_call(prompt)
     data = _parse_llm_json(response)
     refined_query = data.get("refined_query", "") if isinstance(data, dict) else ""
     keywords = data.get("keywords", []) if isinstance(data, dict) else []
+    # 解释说明：为什么这样改写、为何选择这些关键词
+    rationale = data.get("rationale", "") if isinstance(data, dict) else ""
     # 确保 keywords 是字符串列表
     if not isinstance(keywords, list):
         keywords = []
     keywords = [str(k).strip() for k in keywords if k]
     logger.info("refine_query 完成，refined='%s', 关键词数=%d", refined_query, len(keywords))
+    if rationale:
+        # 打印一条详细说明，便于理解 LLM 的改写与选词逻辑
+        logger.info("refine_query 说明：%s", rationale)
+    pdb.set_trace()
     return refined_query, keywords
 
 # 步骤2: 使用关键词匹配章节
@@ -234,6 +323,7 @@ def main():
         # 步骤1
         logger.info("收到用户查询: %s", user_input)
         refined_query, keywords = refine_query(user_input, toc_tree)
+        pdb.set_trace()
         search_history += f"用户查询: {user_input}\nRefined: {refined_query}\n关键词: {keywords}\n"
         
         # 步骤2 & 3 (同步)
