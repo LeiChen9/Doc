@@ -210,7 +210,7 @@ def refine_query(user_input: str, toc_tree: Dict) -> Tuple[str, List[str]]:
     if rationale:
         # 打印一条详细说明，便于理解 LLM 的改写与选词逻辑
         logger.info("refine_query 说明：%s", rationale)
-    pdb.set_trace()
+    # pdb.set_trace()
     return refined_query, keywords
 
 # 步骤2: 使用关键词匹配章节
