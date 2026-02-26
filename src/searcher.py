@@ -31,14 +31,26 @@ def load_knowledge_base() -> Dict:
     logger.info("知识库加载完成，book_tree 章节数=%d", len(data.get("book_tree", {})))
     return data["book_tree"], data["search_guide"]["toc_tree"]
 
-# 扁平化book_tree为段落列表，每个项为(路径字符串, 段落文本)
+# 扁平化 book_tree 为内容单元列表，每个项为 (路径字符串, 该路径下的聚合内容)
 def flatten_book_tree(book_tree: Dict, current_path: str = "") -> List[Tuple[str, str]]:
-    flat_list = []
+    """
+    将嵌套的 book_tree 展开成类似「章-节-小节: 内容」的列表：
+    - key: 路径字符串，例如 "第八章 口腔和牙齿疾病 > 第93节 唇、舌和口腔疾病 > 牙周炎"
+    - value: 该节点下所有 paragraphs 的拼接文本（不包含子节点的内容）
+
+    这样得到的结构与 _build_toc_recall_units 中的「章-节」单元类似，但更进一步到小节/叶子节点，
+    便于基于内容做更细粒度的语义召回。
+    """
+    flat_list: List[Tuple[str, str]] = []
     for title, node in book_tree.items():
         new_path = f"{current_path} > {title}" if current_path else title
-        for para in node.get("paragraphs", []):
-            flat_list.append((new_path, para))
-        flat_list.extend(flatten_book_tree(node.get("children", {}), new_path))
+        paras = node.get("paragraphs", []) or []
+        if paras:
+            text = " ".join(paras)
+            flat_list.append((new_path, text))
+        children = node.get("children", {}) or {}
+        if children:
+            flat_list.extend(flatten_book_tree(children, new_path))
     return flat_list
 
 
@@ -102,6 +114,68 @@ def semantic_recall_toc(refined_query: str, keywords: List[str], toc_tree: Dict,
         "\n".join(debug_info),
     )
     pdb.set_trace()
+    return recalled
+
+
+def secondary_recall_with_content(
+    refined_query: str,
+    keywords: List[str],
+    candidate_paths: List[str],
+    flat_paragraphs: List[Tuple[str, str]],
+    top_k: int = 10,
+) -> List[str]:
+    """
+    在第一轮目录级多路召回的基础上，拼接对应章节的正文内容，再做一轮多路召回。
+    - 输入：第一轮召回得到的路径列表（章 > 节），以及全量扁平段落
+    - 对每个路径，将其下所有段落拼接成文本，作为该路径的“内容单元”
+    - 使用 refined_query + 所有关键词 对这些内容单元再次做语义相似度打分
+    - 返回经过二级召回后的路径列表（按得分排序）
+    """
+    if not candidate_paths:
+        return []
+
+    # 为每个候选路径收集对应的段落文本
+    units: List[Tuple[str, str]] = []
+    for path in candidate_paths:
+        paras = [para for p, para in flat_paragraphs if p.startswith(path)]
+        if not paras:
+            continue
+        # 简单截断，避免文本过长
+        text = path + ": " + " ".join(paras[:50])
+        units.append((path, text))
+
+    if not units:
+        return []
+
+    keys = [k for k, _ in units]
+    texts = [v for _, v in units]
+
+    queries: List[str] = [refined_query] + [kw for kw in keywords if kw]
+    query_embs = embedder.encode(queries)
+    content_embs = embedder.encode(texts)
+
+    scores = util.pytorch_cos_sim(query_embs, content_embs)
+    max_scores = scores.max(dim=0)
+    unit_scores = max_scores.values
+    best_q_idx = max_scores.indices
+
+    k = min(top_k, len(keys))
+    top_scores, top_indices = unit_scores.topk(k)
+    recalled = [keys[i] for i in top_indices.tolist()]
+
+    debug_info = []
+    for rank, (idx, score_val) in enumerate(zip(top_indices.tolist(), top_scores.tolist()), start=1):
+        q_idx = best_q_idx[idx].item()
+        q_text = queries[q_idx]
+        debug_info.append(f"{rank}. {keys[idx]}  (score={float(score_val):.3f}, by='{q_text}')")
+    logger.info(
+        "secondary_recall_with_content 完成，多路查询数=%d，内容单元数=%d，top_k=%d\n%s",
+        len(queries),
+        len(keys),
+        k,
+        "\n".join(debug_info),
+    )
+
     return recalled
 
 # LLM调用函数
@@ -293,6 +367,7 @@ def main():
     logger.info("搜索主循环启动")
     book_tree, toc_tree = load_knowledge_base()
     flat_paragraphs = flatten_book_tree(book_tree)
+    pdb.set_trace()
     logger.info("知识库展开完成，段落总数=%d", len(flat_paragraphs))
     
     search_history = ""  # 记录搜索过程
@@ -308,8 +383,10 @@ def main():
         refined_query, keywords = refine_query(user_input, toc_tree)
         search_history += f"用户查询: {user_input}\nRefined: {refined_query}\n关键词: {keywords}\n"
         
-        # 步骤2: 使用关键词和refined query 进行路召回
-        semantic_matches = semantic_recall_toc(refined_query, keywords, toc_tree)
+        # 步骤2: 使用关键词和 refined_query 对目录单元做第一轮多路召回
+        first_stage_paths = semantic_recall_toc(refined_query, keywords, toc_tree)
+        # 步骤3: 在候选路径基础上，拼接正文内容做第二轮多路召回
+        second_stage_paths = secondary_recall_with_content(refined_query, keywords, first_stage_paths, flat_paragraphs)
         pdb.set_trace()
 
         # 步骤6: 循环返回步骤1
