@@ -131,17 +131,30 @@ def _collect_toc_from_ncx(ncx_xml: str, base_dir: str) -> List[TocEntry]:
 
 
 def _infer_level(title: str) -> int:
-    """基于常见中文标题习惯推测层级，默认最浅为 1。"""
+    """基于常见中文标题习惯推测层级，默认最浅为 1。
+
+    注意：避免把“关节内紊乱”这类包含“节”字的普通名词误判为二级标题，
+    因此这里只识别类似“第八章… / 第96节…”这种模式。
+    """
     t = title.strip()
     if not t:
         return 1
-    if "章" in t:
+
+    # 章：匹配“第…章”或以“章”结尾的常规章节标题
+    if ("第" in t and "章" in t) or t.endswith("章"):
         return 1
-    if "节" in t:
-        return 2
+
+    # 节：匹配“第…节”或以“节”结尾，但排除“关节”“季节”等常见词汇误判
+    if ("第" in t and "节" in t) or t.endswith("节"):
+        # 排除若干常见误判前缀/词根（可以按需扩展）
+        forbid_substrings = ["关节", "季节"]
+        if not any(fs in t for fs in forbid_substrings):
+            return 2
+
     if "附录" in t:
         return 1
-    # 其他标题按 3 级处理
+
+    # 其他标题按 3 级处理（子小节/具体疾病条目等）
     return 3
 
 
@@ -203,54 +216,56 @@ def _select_scope(soup: BeautifulSoup, fragment: Optional[str]):
     return soup.body or soup
 
 
-# 修改后的函数：生成search_guide，使用_infer_level推断层级构建toc_tree
 def _generate_search_guide(toc_entries: List[TocEntry], opf_soup: BeautifulSoup) -> Dict[str, Dict]:
+    """
+    基于 EPUB 目录条目顺序 + 标题模式构造 search_guide.toc_tree：
+    - 不再依赖正文内容，仅使用 nav/toc.ncx 中的标题链和顺序
+    - 通过 `_infer_level` 识别“章 / 节 / 叶子”：
+        level 1: 第…章 / …章 / 附录…
+        level 2: 第…节 / …节（排除“关节”等误判）
+        level 3+: 其他视为叶子条目
+    - 顺序扫描 TOC：
+        遇到 level 1 → 当前章
+        遇到 level 2 → 当前节
+        遇到 level 3+ → 追加到“当前章-节”的 leaf 列表
+
+    这样既完全以 EPUB 目录为锚点，又避免像“细胞/关节内紊乱”这种词被误当成独立章节。
+    """
     toc_tree: Dict[str, Dict[str, List[str]]] = {}
-    stack: List[Tuple[int, Any]] = []  # (level, node) where node is dict for level 1, list for level 2
+    current_chapter: Optional[str] = None
+    current_section: Optional[str] = None
 
     for entry in toc_entries:
-        if not entry.title_chain:
-            continue
-        title = entry.title_chain[-1]
-        if title == "目录":
-            continue
-        level = _infer_level(title)
+        # 一条 entry 可以包含多级 title_chain，这里逐个扫描其中的标题
+        for title in entry.title_chain:
+            if not title:
+                continue
+            if title == "目录":
+                # 跳过总目录本身
+                continue
 
-        while stack and stack[-1][0] >= level:
-            stack.pop()
+            level = _infer_level(title)
 
-        if level == 1:
-            node: Dict[str, List[str]] = {}
-            toc_tree[title] = node
-            stack.append((1, node))
-        elif level == 2:
-            if not stack or stack[-1][0] != 1:
-                # 如果没有章，创建默认章
-                if not stack:
-                    untitled_chapter = "Untitled Chapter"
-                    chapter_node: Dict[str, List[str]] = {}
-                    toc_tree[untitled_chapter] = chapter_node
-                    stack.append((1, chapter_node))
-            chapter_node = stack[-1][1]
-            node: List[str] = []
-            chapter_node[title] = node
-            stack.append((2, node))
-        else:  # level >= 3
-            if not stack or stack[-1][0] != 2:
-                # 如果没有节，创建默认节；如果没有章，先创建章
-                if not stack or stack[-1][0] != 1:
-                    if not stack:
-                        untitled_chapter = "Untitled Chapter"
-                        chapter_node: Dict[str, List[str]] = {}
-                        toc_tree[untitled_chapter] = chapter_node
-                        stack.append((1, chapter_node))
-                chapter_node = stack[-1][1]
-                untitled_section = "Untitled Section"
-                section_node: List[str] = []
-                chapter_node[untitled_section] = section_node
-                stack.append((2, section_node))
-            section_node = stack[-1][1]
-            section_node.append(title)
+            if level == 1:
+                # 新的章节
+                current_chapter = title
+                current_section = None
+                toc_tree.setdefault(current_chapter, {})
+            elif level == 2:
+                # 新的节，确保已在某个章之下；若没有，挂到一个默认章下
+                if current_chapter is None:
+                    current_chapter = "Untitled Chapter"
+                    toc_tree.setdefault(current_chapter, {})
+                current_section = title
+                toc_tree[current_chapter].setdefault(current_section, [])
+            else:
+                # 叶子条目：挂到当前章-节下
+                if current_chapter is None or current_section is None:
+                    # 没有明确的章-节上下文就跳过，避免产生结构错误
+                    continue
+                leaf_list = toc_tree[current_chapter].setdefault(current_section, [])
+                if title not in leaf_list:
+                    leaf_list.append(title)
 
     return {"toc_tree": toc_tree}
 
