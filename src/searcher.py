@@ -60,7 +60,7 @@ def _build_toc_recall_units(toc_tree: Dict) -> List[Tuple[str, str]]:
     return units
 
 
-def semantic_recall_toc(user_input: str, toc_tree: Dict, top_k: int = 20) -> List[str]:
+def semantic_recall_toc(refined_query: str, keywords: List[str], toc_tree: Dict, top_k: int = 10) -> List[str]:
     """
     对 toc_tree 做一次基于语义相似度的召回，返回按相关度排序的路径列表。
     注意：这里只是为了给 LLM 提示一个更短的目录视图，真正的章节/段落检索仍然使用完整 toc_tree，
@@ -69,56 +69,40 @@ def semantic_recall_toc(user_input: str, toc_tree: Dict, top_k: int = 20) -> Lis
     units = _build_toc_recall_units(toc_tree)
     if not units:
         return []
+
     keys = [k for k, _ in units]
     texts = [v for _, v in units]
-    query_emb = embedder.encode(user_input)
+
+    # 多路查询：refined_query + 每个关键词，各自对 toc 做一次相似度评分，再对路径取最大得分
+    queries: List[str] = [refined_query] + [kw for kw in keywords if kw]
+    query_embs = embedder.encode(queries)
     toc_embs = embedder.encode(texts)
-    scores = util.pytorch_cos_sim(query_emb, toc_embs)[0]
+
+    # scores[q_idx, unit_idx]
+    scores = util.pytorch_cos_sim(query_embs, toc_embs)
+    max_scores = scores.max(dim=0)
+    unit_scores = max_scores.values  # shape: [num_units]
+    best_q_idx = max_scores.indices  # 对每个单元来说贡献最大分数的 query 下标
+
     k = min(top_k, len(keys))
-    top_indices = scores.topk(k).indices.tolist()
-    recalled = [keys[i] for i in top_indices]
-    logger.info("semantic_recall_toc 完成，目录单元数=%d，top_k=%d", len(keys), len(recalled))
+    top_scores, top_indices = unit_scores.topk(k)
+    recalled = [keys[i] for i in top_indices.tolist()]
+
+    # 记录一下每个召回路径是被哪个 query 命中的，方便理解效果
+    debug_info = []
+    for rank, (idx, score_val) in enumerate(zip(top_indices.tolist(), top_scores.tolist()), start=1):
+        q_idx = best_q_idx[idx].item()
+        q_text = queries[q_idx]
+        debug_info.append(f"{rank}. {keys[idx]}  (score={float(score_val):.3f}, by='{q_text}')")
+    logger.info(
+        "semantic_recall_toc 完成，多路查询数=%d，目录单元数=%d，top_k=%d\n%s",
+        len(queries),
+        len(keys),
+        k,
+        "\n".join(debug_info),
+    )
     pdb.set_trace()
     return recalled
-
-
-def _build_recalled_outline(recalled_paths: List[str], toc_tree: Dict) -> str:
-    """
-    根据语义召回得到的路径，展开对应「章-节」的本地目录。
-    - 对于只有章节的路径：展示该章节下所有节与子节
-    - 对于“章 > 节”的路径：展示该节下的子节
-    """
-    blocks: List[str] = []
-    for path in recalled_paths:
-        if " > " in path:
-            chapter, section = path.split(" > ", 1)
-        else:
-            chapter, section = path, None
-
-        sections = toc_tree.get(chapter, {})
-        if not isinstance(sections, dict):
-            continue
-
-        lines: List[str] = []
-        if section is None:
-            # 展开整章的节与子节
-            lines.append(f"章节: {chapter}")
-            for sec, subsecs in sections.items():
-                lines.append(f"  - 节: {sec}")
-                for sub in subsecs:
-                    lines.append(f"    - 子节: {sub}")
-        else:
-            subsecs = sections.get(section)
-            if subsecs is None:
-                continue
-            lines.append(f"章节: {chapter} > 节: {section}")
-            for sub in subsecs:
-                lines.append(f"  - 子节: {sub}")
-
-        if lines:
-            blocks.append("\n".join(lines))
-
-    return "\n\n".join(blocks)
 
 # LLM调用函数
 def llm_call(prompt: str, model: str = "gpt-4-turbo") -> str:
@@ -210,7 +194,6 @@ def refine_query(user_input: str, toc_tree: Dict) -> Tuple[str, List[str]]:
     if rationale:
         # 打印一条详细说明，便于理解 LLM 的改写与选词逻辑
         logger.info("refine_query 说明：%s", rationale)
-    # pdb.set_trace()
     return refined_query, keywords
 
 # 步骤2: 使用关键词匹配章节
@@ -320,26 +303,15 @@ def main():
             logger.info("收到 exit 指令，准备退出主循环")
             break
         
-        # 步骤1
+        # 步骤1: 翻译用户查询，提取关键词
         logger.info("收到用户查询: %s", user_input)
         refined_query, keywords = refine_query(user_input, toc_tree)
-        pdb.set_trace()
         search_history += f"用户查询: {user_input}\nRefined: {refined_query}\n关键词: {keywords}\n"
         
-        # 步骤2 & 3 (同步)
-        chapter_matches = match_chapters(keywords, toc_tree)
-        semantic_matches = semantic_match(refined_query, flat_paragraphs)
-        
-        search_history += f"章节匹配: {chapter_matches}\n语义匹配数: {len(semantic_matches)}\n"
-        
-        # 步骤4
-        selected_segments = review_results(chapter_matches, semantic_matches)
-        
-        # 步骤5
-        is_empty = len(selected_segments) == 0
-        response = summarize_and_guide(selected_segments, search_history, is_empty)
-        print(response)
-        
+        # 步骤2: 使用关键词和refined query 进行路召回
+        semantic_matches = semantic_recall_toc(refined_query, keywords, toc_tree)
+        pdb.set_trace()
+
         # 步骤6: 循环返回步骤1
 
 if __name__ == "__main__":
